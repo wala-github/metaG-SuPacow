@@ -1,0 +1,668 @@
+---
+title: "Low vs high differential abundance"
+author: "Wanxin_Lai"
+date: "2024-03-25"
+output:
+  rmarkdown::html_document:
+    theme: lumen
+    highlight: zenburn
+    df_print: default
+    toc: yes
+    toc_float: TRUE
+    keep_md: no
+    code_folding: hide
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+setwd("C:/Users/awala/OneDrive - Norwegian University of Life Sciences/Documents/Small_Cow/MAG/")
+```
+
+```{r, message = FALSE, warning=FALSE}
+library(tidyverse)
+library(ggtree)
+library(phytools)
+library(scales)
+library(ggnewscale)
+library(ggh4x)
+library(gridExtra)
+library(ggtreeExtra)
+library(DT)
+library(pheatmap)
+```
+
+```{r message = FALSE}
+#Percentage of genomes covered by reads
+CF <- read_tsv("./Abundance.coverM_Fraction.tsv")
+
+# Remove T6 samples
+# Modify abundance data
+covered_fraction <- CF %>%
+  select(Genome,matches("Covered Fraction")) %>%
+  filter(Genome != "unmapped")
+
+new_column_names <- covered_fraction %>%
+  select(-1) %>%  # Exclude the first column
+  names() %>%
+  stringr::str_replace(".R1\\.fq\\.gz Covered Fraction", "")
+
+coverage_table <- covered_fraction %>%
+  rename_with(~ new_column_names,-1) %>% 
+  column_to_rownames("Genome") %>% 
+  select(-matches("T6"))
+```
+
+Genomes that have less than 30% of their length covered by reads are turned into zeros to account for the random allocation of reads across genomes due to mapping heuristics.
+
+```{r message = FALSE}
+count <- read_tsv("./misc/Counts.tsv", col_names=T)
+
+#Remove T6 samples
+count_table <- count %>% select(-matches("T6"))
+
+#rearrange row and col order based on count table 
+row_order <- count_table$Genome
+col_order <- colnames(count_table[,c(-1,-2,-3)])
+
+coverage_table.sort <- coverage_table[row_order,col_order]
+
+#filter low-coverage reads
+min_coverage=0.3
+
+# if not zero counts, assign 1
+count_table_cov <- coverage_table.sort %>% 
+  mutate(across(everything(), ~ ifelse(. > min_coverage, 1, 0))) %>% 
+  map2_df(., count_table[, c(-1,-2,-3)], ~ .x * .y) %>% # df x times df y, get the actual count if cov is 1 (>0.3)
+  as.data.frame() %>%
+  select(-c("D55T5", "D67T5"))
+
+rownames(count_table_cov) <- rownames(coverage_table.sort)
+```
+
+```{r Phylum colour scheme, message=FALSE}
+
+phylum_colour <- data.frame(Phylum = sort(unique(count$Phylum)), color = hue_pal()(12))
+
+mags_phylum_colour <- count %>% 
+  select("Genome", "classification", "Phylum") %>% 
+  left_join(phylum_colour, by = join_by(Phylum == Phylum))
+```
+
+
+#### Normalise read counts into genome counts
+The relative representation of each genome depends on its size. 
+```{r message = FALSE}
+#load MAGs table
+mags_table <- read_tsv("./results_ac2/checkm2_quality_report.tsv", col_names = T) %>% 
+  column_to_rownames(var = "Name")
+
+# Transform reads into genome counts 
+# modifying the reads-counts based on the normalisation factor, which is the average genome size (mag_size)
+genome_read_sizes <- mags_table[rownames(count_table_cov),] %>%
+    select(Genome_Size) %>%
+    mutate(mag_size = Genome_Size / 150) %>%
+    pull()
+
+# Compare the size of each genome to the average genome size in the dataset
+# 1 is row, dvd the read size to the row of count_table_cov.
+count_table_cov_size <- sweep(count_table_cov, 1, genome_read_sizes, "/")
+
+# Do the same normalisation for the unfiltered reads counts
+
+raw_count_table_cov_size <- count_table[,-c(2,3)] %>% 
+  column_to_rownames(var = "Genome") %>% 
+  sweep(., 1, genome_read_sizes, "/")
+
+```
+ 
+##### Visualise the relative MAG abundances per sample after filtering the low coverage genome-counts. 
+
+```{r import mashtree file, message = FALSE}
+
+tree <- read.tree("./results_ac2/mashtree/mashtree.newick")
+
+```
+
+##### Generates a count table in which the scale is log10-transformed.
+```{r vertical tree, message = FALSE}
+phylum_colour <- count %>% 
+  select(Genome, Phylum) %>% 
+  column_to_rownames("Genome")
+
+# Generate phylum color heatmap
+heatmap <- mags_phylum_colour %>% arrange(match(Genome, tree$tip.label)) %>%
+  select(Genome,Phylum) %>%
+    mutate(Phylum = factor(Phylum, levels = unique(Phylum))) %>%
+    column_to_rownames(var = "Genome")
+
+# create ultrametric tree
+vertical_tree <- force.ultrametric(tree,method="nnls") %>%
+        ggtree(., size = 0.1)
+
+#first test
+vertical_tree <- gheatmap(vertical_tree, heatmap, width = 0.05, offset = 0, colnames = FALSE)
+
+#Reset fill scale
+vertical_tree <- vertical_tree + new_scale_fill()
+
+count_table_cov_size <- count_table_cov_size %>% 
+  rownames_to_column(var = "Genome") %>%  
+  arrange(match(Genome, tree$tip.label)) %>% 
+  column_to_rownames("Genome")
+```
+
+```{r, message = FALSE, warning=FALSE, fig.width= 9, fig.height=7}
+
+#Add counts
+vertical_tree_count_tbl <- gheatmap(vertical_tree, 
+                          log10(count_table_cov_size), 
+                          offset = 0.2,
+                          colnames_angle=90, 
+                          font.size=3, 
+                          colnames=TRUE,
+                          colnames_position="top", 
+                          colnames_offset_y = 15
+                          ) +
+  vexpand(.08) +
+  coord_cartesian(clip = "off") +
+  scale_fill_gradient(low = "white", high = "steelblue", na.value="white", name = "log10(RA)")
+
+vertical_tree_count_tbl
+```
+
+After applying coverage filtering, the retained dataset appears sparse, with numerous phyla showing predominantly NA (white) counts.
+
+##### Classic phylogenomics tree of 700 MAGs (raw MAGs count table) 
+```{r, fig.height=30, fig.width= 10}
+# Make a back up with tip labels being replaced
+tree.bk <- tree
+
+# Arrange colors alphabetically
+colors_alphabetic <- mags_phylum_colour %>% arrange(match(Genome, tree.bk$tip.label)) %>%
+  select(Phylum, color) %>%
+    unique() %>%
+    arrange(Phylum) %>%
+    select(color) %>%
+    pull()
+
+#Sort phylum table by tree topology and add colors
+mags_phylum_genomes_sorted <- mags_phylum_colour %>%
+  arrange(match(Genome, tree.bk$tip.label))
+
+tree.bk$tip.label <- unlist(lapply(mags_phylum_genomes_sorted[,2], as.character))
+
+
+#Generate Phylum tree image
+
+plot(tree.bk, tip.color = mags_phylum_genomes_sorted$color, cex = 0.4)
+
+```
+
+```{r, eval=FALSE}
+png("phylum_tree.png",width=800,height=2000)
+ggtree(tree.bk) + geom_tiplab(size = 1.5, color = mags_phylum_genomes_sorted$color) + xlim(NA,2) + theme(legend.position='right') + geom_treescale(fontsize=3.5, linesize=0.5, offset=0.5)
+dev.off()
+
+pdf("phylum_tree.pdf",width=27,height=35)
+ggtree(tree.bk) + geom_tiplab(size = 1.5, color = mags_phylum_genomes_sorted$color, align = F) + xlim(NA,2) + theme(legend.position='right') + geom_treescale(fontsize=3.5, linesize=0.5, offset=0.5)
+dev.off()
+```
+
+##### Create Stacked barplot (filtered coverage)
+```{r Load metadata}
+T16meta <- read.table("../counttable/CP958c_T1-T6-metadata.txt", header = T, sep = "\t", row.names = 1)
+#metadata <- data.frame(row.names = T16meta[,1], T16meta[2:ncol(T16meta)])
+
+# include the recent split from Velma and Carl metadata
+vsplit <- read.table("../counttable/metadata_v1.5 1.tsv", header = T, sep = "\t", text = "animal", colClasses = "character")
+vsplit$animal <- paste("A", vsplit$animal, sep="")
+
+# concatenate two metadata into 53 samples
+metadata <- T16meta %>%
+  rownames_to_column("SampleID") %>% 
+  left_join(vsplit, by = c("Animal" = "animal"))
+
+metadata <- data.frame(row.names = metadata[,2], metadata[,c(3,4,5,6,7,29)])
+
+metadata <- metadata %>% filter(!str_detect(Time, "T6"))
+```
+
+#### Table for taxonomy barplot 
+```{r}
+count_table_cov_size_pivot <- count_table_cov_size %>%
+  rownames_to_column("Genome") %>%
+  
+  #apply TSS 
+  mutate_at(vars(-Genome),~./sum(.)) %>% 
+  
+  #reduce to minimum number of columns
+  pivot_longer(-Genome, names_to = "sample", values_to = "count") %>%
+  
+  left_join(., mags_phylum_genomes_sorted, by = join_by(Genome == Genome)) %>%
+  
+   #sort phyla by taxonomy
+  mutate(Phylum = fct_relevel(Phylum)) %>%
+  
+  left_join(., (metadata %>% rownames_to_column(var = "sample") %>% 
+            select(sample, Time, Emission, Breed, vsplit_old)), by = join_by("sample" == "sample")) %>% 
+   filter(!is.na(count))
+
+datatable(count_table_cov_size_pivot)
+```
+
+#### Stacked barplot per individual
+
+```{r Stacked barplot per individual, fig.width= 12}
+
+# Facet groups for coloring
+facet_boxes <- metadata %>%
+  #filter(!is.na(count)) %>%
+  #filter(!is.na(Animal)) %>%
+  #filter(Time %in% c("T1","T2","T3","T4","T5")) %>%
+    distinct(Emission, Breed, Time) %>%
+    arrange(Emission, Time)
+
+### This part is a terrible programming for the stacked barplot because ===================
+### case_match() doesnt work on repeats ===================================================
+
+# create a nested object (stripped bars)
+strip_background <- strip_nested(background_y = elem_list_rect(fill = c(
+        # level1 colors
+        case_match(
+          c(unique(facet_boxes$Emission), unique(facet_boxes$Breed), unique(facet_boxes$Breed), unique(facet_boxes$Time), unique(facet_boxes$Time), unique(facet_boxes$Time), unique(facet_boxes$Time)[-2]),
+          "high" ~ "brown",
+          "low" ~ "orange",
+          "Aberdeen Angus X" ~ "turquoise",
+          "Luing" ~ "yellow",
+          "Aberdeen Angus X" ~ "turquoise",
+          "Luing" ~ "yellow",
+          "T1" ~ "#A3A500",
+          "T2" ~ "#a7ab7e",
+          "T3" ~ "#adcde0",
+          "T4" ~ "#00BF7A",
+          "T5" ~ "#00C1A9",
+          "T1" ~ "#A3A500",
+          "T2" ~ "#a7ab7e",
+          "T3" ~ "#adcde0",
+          "T4" ~ "#00BF7A",
+          "T5" ~ "#00C1A9",
+          "T1" ~ "#A3A500",
+          "T2" ~ "#a7ab7e",
+          "T3" ~ "#adcde0",
+          "T4" ~ "#00BF7A",
+          "T5" ~ "#00C1A9",
+          "T1" ~ "#A3A500",
+          #"T2" ~ "#a7ab7e",
+          "T3" ~ "#adcde0",
+          "T4" ~ "#00BF7A",
+          "T5" ~ "#00C1A9",
+          .default = "grey"
+        )
+    )))
+
+#=========================================================================================
+
+ggplot((count_table_cov_size_pivot %>%  
+          filter(count > 0)) , aes(x=count,y=sample, fill=Phylum, group=Phylum)) + #grouping enables keeping the same sorting of taxonomic units
+  
+    geom_bar(stat="identity", colour="white", linewidth=0.1) + #plot stacked bars with white borders
+    labs(x = "Relative abundance", y ="Samples") +
+    facet_nested(Emission + Breed + Time ~ .,  scales="free", space = "free_y", strip = strip_background) + #facet per day and treatment
+    guides(fill = guide_legend(ncol = 1)) +
+    scale_x_continuous(expand = c(0.001, 0.001)) +
+    theme(axis.text.y = element_text(),
+          axis.title.x = element_blank(),
+          strip.text.y = element_text(angle = 0),
+          panel.background = element_blank(),
+          panel.border = element_blank(),
+          panel.grid.major = element_blank(),
+          panel.grid.minor = element_blank(),
+          axis.line = element_line(linewidth = 0.5, linetype = "solid", colour = "black"),
+          panel.spacing = unit(0, "lines"),
+          legend.position = "right")
+```
+
+
+
+### MAGs quality visualisation 
+#### (Filtered coverage count data)
+```{r}
+# Get Taxa info from metaP
+
+SamplesNames <- readRDS("./01_map_proteome2samples_c6.rds (1).gz") %>%
+  select(sample,matches("tax")) %>%
+  distinct(sample,.keep_all = T)
+
+
+SampleTax <- SamplesNames %>% 
+  column_to_rownames("sample") %>% 
+  setNames(as_tibble(colnames(.)[2:9]) %>%
+             mutate(NEW=c("Domain","Kingdom","Phylum","Class","Order","Family","Genus","Species")) %>%
+             select(NEW) %>%
+             deframe()) %>%
+  rownames_to_column("sample") %>%
+  mutate_at(.vars=vars(Species),
+            .funs = ~
+              str_remove(.,
+                         pattern="NA")) %>%
+  mutate_at(.vars=vars(Species),
+            .funs = ~
+              str_remove(.,
+                         pattern = ".*[[:space:]]")) %>%
+  mutate_at(.vars=vars(Species),
+            .funs = ~
+              str_remove(.,
+                         pattern = "(?<=sp)\\d.*")) %>%
+  mutate_at(.vars = vars(Domain),
+            .funs = ~
+              str_remove_all(.,
+                             pattern = ".*d__")) %>%
+  mutate_at(.vars = vars(Phylum),
+            .funs = ~
+              str_remove_all(.,
+                             pattern = ".*p__")) %>%
+  mutate_at(.vars = vars(Phylum),
+            .funs = ~
+              str_remove_all(.,
+                             pattern = "_..*")) %>% 
+  mutate_at(.vars = vars(Class),
+            .funs = ~
+              str_remove_all(.,
+                             pattern = ".*c__")) %>%
+  mutate_at(.vars = vars(Order),
+            .funs = ~
+              str_remove_all(.,
+                             pattern = ".*o__")) %>%
+  mutate_at(.vars = vars(Family),
+            .funs = ~
+              str_remove_all(.,
+                             pattern = ".*f__")) %>%
+  mutate_at(.vars = vars(Genus),
+            .funs = ~
+              str_remove_all(.,
+                             pattern = ".*g__")) %>%
+  mutate_at(.vars = vars(Genus),
+            .funs = ~
+              str_remove_all(.,
+                             pattern = "_..*")) %>%
+  mutate_at(.vars = vars(Species),
+            .funs = ~
+              str_remove_all(.,
+                             pattern = ".*s__")) %>% 
+  mutate(Family = if_else(Family == "NA", Order, Family)) %>% 
+  mutate(Genus = if_else(Genus == "NA", Family, Genus))
+
+#convert empty string to sp
+SampleTax$Species <- replace(SampleTax$Species, SampleTax$Species == "", "sp")
+
+
+```
+
+
+#### MAG quality table
+```{r message = FALSE, warning=FALSE}
+mags_details <- mags_table %>%
+  rownames_to_column(var = "Genome") %>% 
+  left_join(., SampleTax, by = join_by(Genome == sample)) %>% 
+  select(c(Genome,Domain,Phylum,Genus,Species,Completeness,Contamination,Genome_Size)) %>%
+  
+  #change mags_size to MBs
+  mutate(mag_size=round(Genome_Size/1000000, 2)) %>% 
+  #rename columns
+  #rename(., Comp = Completeness, Cont = Contamination, Mag_size = Genome_Size) %>% 
+  remove_rownames() %>%
+  arrange(match(Genome, rev(tree$tip.label))) #sort MAGs according to phylogenetic tree
+
+head(mags_details)
+```
+
+##### MAGs circular tree
+```{r circular tree, warning=FALSE, message = FALSE, fig.width= 11, fig.height=8}
+# Generate the phylum color heatmap
+phylum_heatmap <- mags_details %>%
+  left_join(mags_phylum_colour, by=join_by(Genome == Genome)) %>%
+   arrange(match(Genome, tree$tip.label)) %>% 
+    select(-Phylum.y) %>%
+    mutate(Phylum = factor(Phylum.x, levels = unique(Phylum.x))) %>%
+    select(-Phylum.x) %>%
+    column_to_rownames(var = "Genome")
+
+# baseline tree
+circular_tree <- force.ultrametric(tree, method="extend") %>% # extend to ultrametric for visualisation
+    ggtree(., layout="circular", size=0.1, open.angle = 45)
+
+# Add phylum ring
+circular_tree <- gheatmap(circular_tree, heatmap, offset=0.60, width=0.1, colnames=FALSE) +
+        geom_tiplab2(size=0.8, hjust=-0.1) +
+        theme(legend.position = "right", legend.title = element_text("Phylum"), plot.margin = margin(0, 0, 0, 0), panel.margin = margin(0, 0, 0, 0))
+
+
+# Flush color scale to enable a new color scheme in the next ring
+circular_tree <- circular_tree + new_scale_fill()
+
+# Add completeness ring
+circular_tree <- circular_tree +
+        new_scale_fill() +
+        scale_fill_gradient(low = "#d1f4ba", high = "#f4baba") +
+        geom_fruit(
+                data=mags_details,
+                geom=geom_bar,
+                mapping = aes(x=Completeness, y=Genome, fill=Contamination),
+                offset = 0.8,
+                orientation="y",
+              stat="identity")
+
+# Add genome-size ring
+circular_tree <-  circular_tree +
+        new_scale_fill() +
+        scale_fill_manual(values = "#cccccc") +
+        geom_fruit(
+             data=mags_details,
+             geom=geom_bar,
+             mapping = aes(x=mag_size, y=Genome),
+                 offset = 0.05,
+                 orientation="y",
+         stat="identity")
+# Add text
+circle_tree <- circular_tree +
+        annotate('text', x=1.7, y=0.0, label='             Phylum', size=3) +
+        annotate('text', x=1.9, y=0.0, label='                         Genome quality', size=3) +
+        annotate('text', x=2.1, y=0.0, label='                       Genome size', size=3) 
+
+circle_tree %>% 
+   open_tree(20) %>% rotate_tree(90)
+
+```
+
+
+#### Create composite figure
+
+```{r composite fig, warning=FALSE, fig.width= 11, fig.height=9}
+# First create a biplot chart
+mag_stats_biplot <- mags_details %>%
+        ggplot(aes(x=Completeness,y=Contamination,size=Genome_Size,color=Phylum)) +
+              geom_point(alpha=0.7) +
+                    ylim(c(10,0)) +
+                    #scale_color_manual(values=colors_alphabetic) +
+                labs(y= "Contamination", x = "Completeness") +
+                    theme_classic() +
+                  theme(legend.position = "bottom")
+
+# X and Y axis boxplots to complement the plot and MAG quality statistics.
+
+#contamination
+mag_stats_cont <- mags_details %>%
+            ggplot(aes(y=Contamination)) +
+                    ylim(c(10,0)) +
+                    geom_boxplot(colour = "#999999", fill="#cccccc") +
+                    theme_void() +
+                    theme(legend.position = "none",
+                        axis.title.x = element_blank(),
+                        axis.title.y = element_blank(),
+                        axis.text.y=element_blank(),
+                  axis.ticks.y=element_blank(),
+                        axis.text.x=element_blank(),
+                  axis.ticks.x=element_blank(),
+                        plot.margin = unit(c(0, 0, 0.40, 0),"inches")) #add bottom-margin (top, right, bottom, left)
+
+mag_stats_comp <-mags_details %>%
+        ggplot(aes(x=Completeness)) +
+                xlim(c(50,100)) +
+                geom_boxplot(colour = "#999999", fill="#cccccc") +
+                theme_void() +
+                theme(legend.position = "none",
+                    axis.title.x = element_blank(),
+                    axis.title.y = element_blank(),
+                    axis.text.y=element_blank(),
+              axis.ticks.y=element_blank(),
+                    axis.text.x=element_blank(),
+              axis.ticks.x=element_blank(),
+                    plot.margin = unit(c(0, 0, 0, 0.50),"inches")) #add left-margin (top, right, bottom, left)
+```
+
+
+
+```{r fig.width= 11, fig.height=8}
+grid.arrange(grobs = list(mag_stats_comp,mag_stats_biplot,mag_stats_cont),
+        layout_matrix = rbind(c(1,1,1,1,1,1,1,1,1,1,1,4),
+                                                    c(2,2,2,2,2,2,2,2,2,2,2,3),
+                                                    c(2,2,2,2,2,2,2,2,2,2,2,3),
+                                                    c(2,2,2,2,2,2,2,2,2,2,2,3),
+                                                    c(2,2,2,2,2,2,2,2,2,2,2,3),
+                                                    c(2,2,2,2,2,2,2,2,2,2,2,3),
+                                                    c(2,2,2,2,2,2,2,2,2,2,2,3),
+                                                    c(2,2,2,2,2,2,2,2,2,2,2,3),
+                                                    c(2,2,2,2,2,2,2,2,2,2,2,3),
+                                                    c(2,2,2,2,2,2,2,2,2,2,2,3),
+                                                    c(2,2,2,2,2,2,2,2,2,2,2,3),
+                                                    c(2,2,2,2,2,2,2,2,2,2,2,3)))
+```
+
+MAGs are ordinated according to their completeness and contamination scores, while dot sizes indicate their genome-size(MBs).
+
+
+```{r bad mags}
+#Get list of present MAGs
+present_MAGs <- count_table_cov_size %>%
+        filter(rowSums(.) != 0) %>%
+        rownames()
+
+present_phylum <- unique(count[count$Genome %in% present_MAGs,]$Phylum)
+
+cat("700 MAGs passed through a coverage filter of 0.03, resulting in ", length(present_MAGs), " remaining.
+    \n\nOverall phyla detected: ", length(unique(count$Phylum)), "
+    \nRemaining phyla: ", length(present_phylum),"\n")
+
+cat("Bad MAGs with zero genome count for every samples:\n ")
+
+bad.mags <- count_table_cov_size %>%
+        filter(rowSums(.) == 0) %>%
+        rownames()
+
+#cat("Genome count of bad MAGs:\n ")
+
+mags_details %>% filter(Genome %in% bad.mags) 
+
+```
+
+##### Heatmap for overall
+```{r}
+phylum_colour <- data.frame(Phylum = (unique(count_table$Phylum)), color = (hue_pal()(12)))
+Phylum_colour <- setNames(phylum_colour$color, phylum_colour$Phylum)
+
+
+logged <- count_table_cov_size[rownames(count_table_cov_size) != bad.mags, ]
+mags_details.clm <- mags_details %>%
+  column_to_rownames("Genome") %>% 
+  filter(!(rownames(.) %in% bad.mags)) %>% 
+  rownames_to_column("Genome")
+
+colors <- rev(viridis::inferno(12))
+
+
+annot.row <- data.frame(row.names = count_table$Genome, Phylum = as.factor(count_table$Phylum))
+#phylum_colour <- phylum_colour[match(unique(phylum_colour$Phylum), unique(annot.row$Phylum)),]
+
+anno.col <- data.frame(row.names = rownames(metadata), Emission = as.factor(metadata[,5]),Timepoint = as.factor(metadata[,2]), Breed = as.factor(metadata[,4]), Split = as.factor(metadata[,6]))
+
+
+
+breakList = seq(0, 3, by = 0.25)
+
+logged[is.na(logged)] <- 0
+
+pheatmap(log2(logged + 1),
+         cluster_rows = T,
+         cluster_cols = F,
+         color = colors,
+         cellwidth = 10,
+         breaks = breakList,
+         annotation_col = anno.col,
+         annotation_row = annot.row,
+         annotation_colors = list(Phylum = Phylum_colour),
+         show_rownames = F,
+         legend = T,
+         scale = "row",
+         correlation = "Ward.D2"
+         )
+```
+```{r}
+metadata <- metadata[order(metadata$vsplit_old),]
+
+pheatmap(log2(logged[,rownames(metadata)] + 1),
+         cluster_rows = T,
+         cluster_cols = F,
+         color = colors,
+         cellwidth = 10,
+         breaks = breakList,
+         annotation_col = anno.col,
+         annotation_row = annot.row,
+         annotation_colors = list(Phylum = Phylum_colour),
+         show_rownames = F,
+         legend = T,
+         scale = "row",
+         correlation = "Ward.D2"
+         )
+```
+```{r}
+
+metadata <- metadata[order(metadata$Emission),]
+
+pheatmap(log2(logged[,rownames(metadata)] + 1),
+         cluster_rows = T,
+         cluster_cols = F,
+         color = colors,
+         cellwidth = 10,
+         breaks = breakList,
+         annotation_col = anno.col,
+         annotation_row = annot.row,
+         annotation_colors = list(Phylum = Phylum_colour),
+         show_rownames = F,
+         legend = T,
+         scale = "row",
+         correlation = "Ward.D2"
+         )
+```
+
+```{r}
+write.table(count_table_cov_size, file = "./Relative_abundance_0.3_thres.txt", quote = F, sep = "\t")
+
+save(raw_count_table_cov_size, 
+     bad.mags,
+     tree,
+     metadata,
+     count_table,
+     count_table_cov, # reads count table after 0.3
+     count_table_cov_size, # genome counts table
+     count_table_cov_size_pivot, 
+     metadata, 
+     mags_phylum_genomes_sorted, 
+     mags_details, 
+     file = "./01_Filter_count.RData")
+
+#load("C:/Users/awala/OneDrive - Norwegian University of Life Sciences/Documents/Small_Cow/MAG/01_Filter_count.RData")
+```
+
+
+

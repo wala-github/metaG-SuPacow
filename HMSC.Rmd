@@ -1,0 +1,1103 @@
+---
+title: "HMSC"
+author: "Wanxin_Lai"
+date: "2024-05-12"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup}
+load("./01_Filter_count.RData")
+load("./03_da.RData")
+load("./14September2024.RData")
+```
+
+```{r , message = FALSE, warning=FALSE}
+library(tidyverse)
+library(scales)
+library(phytools)
+library(ggnewscale)
+library(DT)
+library(cowplot)
+library(ggpubr)
+library(Hmsc)
+library(vioplot)
+library(colorspace)
+library(ggtree)
+library(ggtreeExtra)
+library(ape)
+library(reshape)
+library(distillR)
+library(hilldiv2)
+```
+
+
+```{r random effect}
+# Random effects data (study design)
+StudyDesign <- metadata %>%
+  as.data.frame() %>% 
+  rownames_to_column("Sample") %>% 
+  select(Sample, Animal) %>%
+  filter(! Sample %in% c("D55T5", "D67T5")) %>% 
+  mutate(Animal = as.factor(Animal)) %>% 
+  distinct() %>%
+  column_to_rownames("Sample")
+
+# Genome phylogeny
+# create ultrametric tree
+PData <- read.tree("./mashtree.newick") %>%
+  keep.tip(rownames(count_table_cov)) %>% 
+  force.ultrametric(.,method="extend")
+
+# Genome count table (quantitative community data)
+YData <- count_table_cov %>%
+  select(-c("D55T5", "D67T5")) %>% 
+  subset(., select = -c("D55T5", "D67T5")) %>% 
+  .[PData$tip.label,] %>% 
+  mutate(across(where(is.numeric), ~ . +1 )) %>% #add +1 pseudocount to remove zeros
+  mutate(across(where(is.numeric), ~ . / (mags_details$Genome_Size / 150) )) %>% #transform to genome counts
+  mutate(across(where(is.numeric), ~  log(.) )) %>% #log-transform
+  t() # transpose
+
+
+# Fixed effects data (explanatory variables)
+XData <- metadata %>%
+  as.data.frame() %>% 
+  rownames_to_column("Sample") %>% 
+  filter(! Sample %in% c("D55T5", "D67T5")) %>% 
+  select(Sample, Time, Breed, Treatment, vsplit_old, Emission) %>%
+  mutate(Emission = factor(Emission)) %>%
+  mutate(Breed = factor(Breed)) %>%
+  mutate(Time = factor(Time)) %>%
+  mutate(Treatment = factor(Treatment)) %>% 
+  mutate(Vsplit = factor(vsplit_old)) %>% 
+  mutate(logseqdepth = count_table_cov %>% #total log-sequencing depth
+           select(all_of(row.names(StudyDesign))) %>%
+                        colSums() %>%
+                        log()
+                    ) %>% 
+  distinct() %>%
+  column_to_rownames("Sample") %>% 
+  select(Time, Breed, Treatment, Vsplit, logseqdepth, Emission)
+
+save(YData,XData,StudyDesign,PData,
+     file="./hmsc_input_less2.Rdata")
+```
+
+### Define formulas of the Hmsc model
+# +++ include log sequencing depth
+```{r define hmsc model }
+
+# Fixed effects formula
+XFormula1 = ~Emission + Breed + logseqdepth + Vsplit + Time
+
+# Study design
+rL.animal = HmscRandomLevel(units = levels(StudyDesign$Animal))
+
+
+#Define models
+model1 = Hmsc(Y= YData,
+         XData = XData,
+         XFormula = XFormula1,
+         studyDesign = StudyDesign,
+         phyloTree = PData,
+         ranLevels = list("Animal"=rL.animal),
+         distr = "normal",
+         YScale = TRUE)
+
+#Save list of models as an R object.
+models = list(model1)#, model2)
+if (!dir.exists("modelsminus2")){dir.create("modelsminus2")}
+save(models, file = "./modelsminus2/hmsc_models_setup.Rdata")
+
+```
+
+```{r}
+if (!dir.exists("modelsminus2/panels")){dir.create("modelsminus2/panels")}
+
+localDir = "./modelsminus2"
+ModelDir = file.path(localDir, "models")
+PanelDir = file.path(localDir, "panels")
+nst = length(thin_list)
+```
+
+## Skip this part if you wanna rerun, start from AIC
+### Define MCMC
+#### Sampling and Data
+#### include a threshold at least the mag in minimum 4/5 smaples and relative abundance
+```{r declare parameter, eval=FALSE}
+models=list(model1)
+models=list(model2)
+modelnames=c("WithTreatment","NoTreatment")
+
+# How often to sample the MCMC
+samples_list = c(50, 150)
+# The number of MCMC steps between each recording sample
+thin_list = c(1, 5)
+# No. of MCMC chain to use
+nChains = 4
+```
+
+```{r converging, eval=FALSE}
+for(Lst in 1:length(samples_list)){
+  thin = thin_list[Lst]
+  samples = samples_list[Lst]
+  for(i in 1:length(models)){
+    
+    # model fitting
+    m = sampleMcmc(models[[i]], 
+                   samples = samples,
+                   thin=thin,
+                   adaptNf=rep(ceiling(0.4*samples*thin),models[[i]]$nr),
+                   transient = ceiling(0.5*samples*thin),
+                   nChains = nChains,
+                   nParallel = nChains)
+    
+    # save file
+    filename=paste("model_",modelnames[i], "_thin_", as.character(thin),
+                   "_samples_", as.character(samples),
+                   "_chains_",as.character(nChains),".Rdata",sep = "")
+    save(m,file=file.path(getwd(),'./modelsminus2',filename))
+  }
+} 
+
+```
+
+```{r eval = FALSE}
+
+# assess chain convergence
+
+for(i in 1:length(modelnames)){
+
+  ma = NULL
+  na = NULL
+  ma_gamma = NULL
+  na_gamma = NULL
+  ma_rho = NULL
+  na_rho = NULL
+  
+  for (Lst in 1:nst) {
+    
+    thin = thin_list[Lst]
+    samples = samples_list[Lst]
+    
+    filename = paste("model_",modelnames[i], "_thin_", as.character(thin),
+                     "_samples_", as.character(samples),
+                     "_chains_",as.character(nChains),'.Rdata',sep = "")
+    
+    #print(filename)
+    
+    load(file=file.path(localDir,filename))
+    
+   # print(file)
+    
+    mpost <- convertToCodaObject(m, spNamesNumbers = c(T,F), covNamesNumbers = c(T,F))
+    
+    #fixed effects
+    psrf.beta <- gelman.diag(mpost$Beta,multivariate=FALSE)$psrf
+    
+    #traits
+    psrf.gamma <- gelman.diag(mpost$Gamma,multivariate=FALSE)$psrf
+    
+    #phylogeny
+    psrf.rho <- gelman.diag(mpost$Rho,multivariate=FALSE)$psrf
+    
+  
+    if(is.null(ma)){
+      ma=psrf.beta[,1]
+      na = paste0("model_",as.character(i),"_",as.character(thin),",",as.character(samples))
+    } else {
+      ma = cbind(ma,psrf.beta[,1])
+      na = c(na,paste0("model_",as.character(i),"_",as.character(thin),",",as.character(samples)))
+    }
+    if(is.null(ma_gamma)){
+      ma_gamma=psrf.gamma[,1]
+      na_gamma = paste0("model_",as.character(i),"_",as.character(thin),",",as.character(samples))
+    } else {
+      ma_gamma = cbind(ma_gamma,psrf.gamma[,1])
+      na_gamma = c(na_gamma,paste0("model_",as.character(i),"_",as.character(thin),",",as.character(samples)))
+    }
+    if(is.null(ma_gamma)){
+      ma_rho=psrf.rho[,1]
+      na_rho = paste0("model_",as.character(i),"_",as.character(thin),",",as.character(samples))
+    } else {
+      ma_rho = cbind(ma_rho,psrf.rho[,1])
+      na_rho = c(na_rho,paste0("model_",as.character(i),"_",as.character(thin),",",as.character(samples)))
+    }
+  }
+  panel.name=paste("MCMC_convergence", "_model_",as.character(i),".pdf",sep = "")
+  pdf(file=file.path(PanelDir,panel.name))
+  #print(file)
+  par(mfrow=c(2,1))
+  vioplot(ma,col=rainbow_hcl(1),names=na,ylim=c(0,max(ma)),main="psrf(beta)")
+  vioplot(ma,col=rainbow_hcl(1),names=na,ylim=c(0.9,1.1),main="psrf(beta)")
+  par(mfrow=c(2,1))
+  vioplot(ma_gamma,col=rainbow_hcl(1),names=na_gamma,ylim=c(0,max(ma_gamma)),main="psrf(gamma)")
+  vioplot(ma_gamma,col=rainbow_hcl(1),names=na_gamma,ylim=c(0.9,1.1),main="psrf(gamma)")
+  par(mfrow=c(2,1))
+  boxplot(ma_rho,col=rainbow_hcl(1),names=na_rho,ylim=c(0,max(ma_rho)),main="psrf(rho)")
+  dev.off()
+}
+```
+
+To test for MCMC convergence, measuring the scale reduction factor: the beta (response to perturbations), gamma (trait response to perturbations), and rho parameters (phylogenetic signal).
+
+
+### Model variance
+```{r eval=FALSE}
+preds <- computePredictedValues(m)
+
+MF = evaluateModelFit(hM=m, predY=preds)
+mean(MF$R2, na.rm = T)
+```
+
+
+
+### cross validation 80:20 AUC
+### AIC
+```{r eval =FALSE}
+modelnames=c("NoTreatment")
+
+####Evaluate model fit
+
+i=1 #Notime
+filename = paste("model_",modelnames[i], "_thin_", as.character(thin),
+                 "_samples_", as.character(samples),
+                 "_chains_",as.character(nChains),".Rdata",sep = "")
+print(filename)
+load(file=file.path(localDir,filename))
+
+m_NoInt=m
+m_NoInt_WAIC=computeWAIC(m_NoInt,byColumn =TRUE)
+median(m_NoInt_WAIC,na.rm = TRUE)
+predY.MF.NoInt=computePredictedValues(m_NoInt, expected=FALSE)
+EpredY.MF.NoInt=apply(predY.MF.NoInt, MARGIN=1:2, mean)
+
+plot(m_NoInt$Y,EpredY.MF.NoInt)
+abline(coef = c(0,1),col="red")
+MF.NoInt=evaluateModelFit(hM=m_NoInt, predY=predY.MF.NoInt)
+mean(MF.NoInt$R2)
+```
+
+```{r eval = FALSE}
+i=2 
+filename = paste("model_",modelnames[i], "_thin_", as.character(thin),
+                 "_samples_", as.character(samples),
+                 "_chains_",as.character(nChains),".Rdata",sep = "")
+load(file=file.path(localDir,filename))
+print(filename)
+m_NoInt=m
+m_NoInt_WAIC=computeWAIC(m_NoInt,byColumn =TRUE)
+median(m_NoInt_WAIC,na.rm = TRUE)
+predY.MF.NoInt=computePredictedValues(m_NoInt, expected=FALSE)
+EpredY.MF.NoInt=apply(predY.MF.NoInt, MARGIN=1:2, mean)
+
+plot(m_NoInt$Y,EpredY.MF.NoInt)
+abline(coef = c(0,1),col="red")
+MF.NoInt=evaluateModelFit(hM=m_NoInt, predY=predY.MF.NoInt)
+mean(MF.NoInt$R2)
+```
+
+
+A support threshold of ‘0.05’ to assign significance, meaning that parameters with posterior overlaps of <10% are considered significantly different.
+
+```{r}
+
+# Select desired support threshold
+support=0.9
+negsupport=1-support
+
+# Basal tree
+postestimates_tree <- tree %>%
+        keep.tip(., tip=m$spNames)
+
+# Posterior estimate table
+post_beta <- getPostEstimate(hM=m, parName="Beta")$support %>%
+    as.data.frame() %>%
+    mutate(variable=m$covNames) %>%
+    pivot_longer(!variable, names_to = "genome", values_to = "value") %>%
+    mutate(genome=factor(genome, levels=rev(postestimates_tree$tip.label))) %>%
+    #mutate(value = case_when(
+    #      value >= support ~ "Positive",
+    #      value <= negsupport ~ "Negative",
+    #      TRUE ~ "Neutral")) %>%
+    mutate(value=factor(value, levels=c("Positive","Neutral","Negative"))) %>%
+    pivot_wider(names_from = variable, values_from = value) %>%
+    ##rename(intercept=2) %>%
+    ##select(genome,dominance,groupvariable) %>%
+    column_to_rownames(var="genome")
+
+```
+
+
+```{r}
+# Basal ggtree
+postestimates_tree <- postestimates_tree %>%
+        force.ultrametric(.,method="extend") %>%
+        ggtree(., size = 0.3) #+ layout_dendrogram()
+
+phylum_colour <- data.frame(Phylum = (unique(mags_phylum_genomes_sorted$Phylum)), color = (hue_pal()(12)))
+
+Phylum_colour <- setNames(phylum_colour$color, phylum_colour$Phylum)
+
+heatmap <- mags_phylum_genomes_sorted %>% arrange(match(Genome, postestimates_tree$tip.label)) %>%
+  select(Genome,Phylum) %>%
+    mutate(Phylum = factor(Phylum, levels = unique(Phylum))) %>%
+    column_to_rownames(var = "Genome")
+
+postestimates_tree <- gheatmap(postestimates_tree, heatmap, offset=0, width=0.1, colnames=FALSE) +
+      labs(fill="Phylum") 
+
+```
+
+
+```{r}
+#Reset fill scale to use a different colour profile in the heatmap
+postestimates_tree <- postestimates_tree + new_scale_fill()
+
+# Add posterior significant heatmap
+postestimates_tree <- gheatmap(postestimates_tree, post_beta, offset=0.1, width=0.3, colnames=TRUE, colnames_position="top",colnames_angle=90, colnames_offset_y=0.8, hjust=0, font.size = 1.5) +
+        scale_fill_manual(values=c("#be3e2b","#f4f4f4","#b2b530"))+
+        labs(fill="Trend")+ theme(legend.position = "none")
+
+
+#Reset fill scale to use a different colour profile in the heatmap
+postestimates_tree <- postestimates_tree + new_scale_fill()
+
+```
+
+```{r}
+name_list <- tibble(full_name = colnames(GIFTs_elements_names)) %>%
+  separate(full_name, into = c("Code", "Elements"), sep = " ", extra = "merge") %>% 
+  mutate(Full_name = colnames(GIFTs_elements_names)) %>% 
+  select(!Elements) 
+
+# Create a named vector for renaming
+function_table_name <- GIFTs_elements_filtered %>% 
+  rename_with(~deframe(name_list)[.x], .cols = name_list$Code) %>% 
+  select(any_of(name_list$Full_name))
+
+function_table <- function_table_name %>% 
+  rownames_to_column(var = "Genome") %>%
+arrange(match(Genome, postestimates_tree$tip.label)) %>% 
+  arrange(match(Genome, tree$tip.label)) %>% 
+  column_to_rownames("Genome")
+```
+
+
+```{r fig.height=11}
+
+# Select desired support threshold
+support=0.9
+negsupport=1-support
+
+postestimate_test_emi <- getPostEstimate(hM=m, parName="Beta")$support %>%
+      as.data.frame() %>%
+      mutate(variable=m$covNames) %>%
+      pivot_longer(!variable, names_to = "genome", values_to = "value") %>%
+      mutate(trend = case_when(
+            value >= support ~ "Positive",
+            value <= negsupport ~ "Negative",
+            TRUE ~ "Neutral")) %>%
+      filter(variable==c("Emissionlow"), trend!="Neutral") %>%
+      select(genome,trend) %>%
+      left_join(function_table %>% rownames_to_column(var="genome"), by=join_by(genome==genome)) %>%
+      pivot_longer(-c(genome,trend), names_to = "trait", values_to = "value") %>%
+      group_by(trait) %>%
+      summarise(p_value = wilcox.test(value ~ trend)$p.value) %>%
+      mutate(p_adjust=p.adjust(p_value, method="BH")) %>%
+      filter(p_adjust < 0.05)
+
+
+postestimate_test_breed <- getPostEstimate(hM=m, parName="Beta")$support %>%
+      as.data.frame() %>%
+      mutate(variable=m$covNames) %>%
+      pivot_longer(!variable, names_to = "genome", values_to = "value") %>%
+      mutate(trend = case_when(
+            value >= support ~ "Positive",
+            value <= negsupport ~ "Negative",
+            TRUE ~ "Neutral")) %>%
+      filter(variable==c("BreedLuing"), trend!="Neutral") %>%
+      select(genome,trend) %>%
+      left_join(function_table %>% rownames_to_column(var="genome"), by=join_by(genome==genome)) %>%
+      pivot_longer(-c(genome,trend), names_to = "trait", values_to = "value") %>%
+      group_by(trait) %>%
+      summarise(p_value = wilcox.test(value ~ trend)$p.value) %>%
+      mutate(p_adjust=p.adjust(p_value, method="BH")) %>%
+      filter(p_adjust < 0.05)
+
+
+# extra = "merge" argument ensures that any additional spaces in the names are included in the last_name column.
+name_list <- tibble(full_name = colnames(GIFTs_elements_names)) %>%
+  separate(full_name, into = c("Code", "Elements"), sep = " ", extra = "merge") %>% 
+  mutate(Full_name = colnames(GIFTs_elements_names)) %>% 
+  select(!Elements) %>% 
+  left_join(postestimate_test_emi, by = join_by(Full_name == trait)) %>% 
+  mutate(new_Full_name = ifelse(!is.na(p_adjust),paste(Full_name,"*", sep = " "), Full_name))# %>% 
+
+
+name_list_selected <- name_list %>% select(Code, new_Full_name)
+                                           
+# Convert the selected name_list to a named vector using deframe
+name_vector <- deframe(name_list_selected)
+
+
+function_table_name <- GIFTs_elements_filtered %>%
+  rename_with(~ name_vector[.x], .cols = names(name_vector)) %>%
+  select(any_of(name_list_selected$new_Full_name))
+
+
+function_table_postestimate <- function_table_name %>% 
+  rownames_to_column(var = "Genome") %>%
+arrange(match(Genome, postestimates_tree$tip.label)) %>% 
+  arrange(match(Genome, tree$tip.label)) %>% 
+  column_to_rownames("Genome")
+ 
+hclust_func_community <- hclust(dist(t(function_table_postestimate)), method = "ward.D2")
+
+```
+
+```{r}
+postestimates_tree_plot <- gheatmap(postestimates_tree, function_table_postestimate[,hclust_func_community$order], offset=0.42, width = 4, colnames=TRUE, colnames_angle = 90, hjust = 0, colnames_position = "top", font.size = 1.5) +
+            vexpand(.1) +
+            coord_cartesian(clip = "off") +
+            scale_fill_gradient(low = "darkorange", high = rev(c("#4C00FF","#00E5FF","yellow")),na.value="white") +
+            labs(fill="Function fullness")
+
+postestimates_tree_plot
+
+noleg <- postestimates_tree_plot + theme(legend.position = "none")
+
+noleg 
+```
+
+```{r}
+breakList = seq(0, 1, length.out = 101)
+#colors <- colorRampPalette(c("orange","yellow","#00E5FF","#4C00FF"))(100)
+annot.col <- data.frame(row.names = count_table$Genome, Phylum = as.factor(count_table$Phylum))
+
+phylum_colour <- data.frame(Phylum = (unique(count_table$Phylum)), color = (hue_pal()(12)))
+Phylum_colour <- setNames(phylum_colour$color, phylum_colour$Phylum)
+
+pheatmap(t(function_table_postestimate),
+         cluster_rows = T,
+         cluster_cols = T,
+         #color = colors,
+         cutree_rows = 5,
+         cutree_cols = 2,
+         fontsize_row= 4.6,
+         annotation_col = annot.col,
+         show_colnames = F,
+         clustering_method="ward.D2",
+         annotation_colors = list(Phylum = Phylum_colour)
+         #annotation_legend = 0
+         )
+```
+
+### MAGs positively associated with low methane emission
+
+```{r}
+low.emi.MAG <- getPostEstimate(hM=m, parName="Beta")$support %>%
+    as.data.frame() %>%
+    mutate(variable=m$covNames) %>%
+    pivot_longer(!variable, names_to = "genome", values_to = "value") %>%
+    mutate(trend = case_when(
+          value >= support ~ "Positive",
+          value <= negsupport ~ "Negative",
+          TRUE ~ "Neutral")) %>%
+    filter(variable=="Emissionlow", trend=="Positive") %>%
+    arrange(-value) %>%
+    left_join(mags_details,by=join_by(genome==Genome)) 
+write.csv(low.emi.MAG, file = "./modelsminus2/panels/low_emi_MAGs.csv")
+datatable(low.emi.MAG)
+```
+
+### MAGs negatively associated with low methane emission
+
+```{r}
+high.emi.MAG <- getPostEstimate(hM=m, parName="Beta")$support %>%
+    as.data.frame() %>%
+    mutate(variable=m$covNames) %>%
+    pivot_longer(!variable, names_to = "genome", values_to = "value") %>%
+    mutate(trend = case_when(
+          value >= support ~ "Positive",
+          value <= negsupport ~ "Negative",
+          TRUE ~ "Neutral")) %>%
+    filter(variable=="Emissionlow", trend=="Negative") %>%
+    #mutate(value = 1- value) %>% 
+    arrange(-value) %>%
+    left_join(mags_details,by=join_by(genome==Genome))
+high.emi.MAG
+write.csv(high.emi.MAG, file = "~/Small_Cow/MAG/hmsc_split_seaweed/modelsminus2/panels/high_emi_MAGs.csv")
+datatable(high.emi.MAG)
+
+#save(low.emi.MAG,high.emi.MAG, file = "~/Small_Cow/MAG/hmsc_split_seaweed/panels/emi_lowhigh_MAGs_hmsc.RData")
+```
+
+
+### Estimate - support plot (Emission)  
+```{r}
+estimate <- getPostEstimate(hM=m, parName="Beta")$mean %>%
+    as.data.frame() %>%
+    mutate(variable=m$covNames) %>%
+    filter(variable=="Emissionlow") %>%
+    pivot_longer(!variable, names_to = "genome", values_to = "mean") %>%
+    select(genome,mean)
+
+support <- getPostEstimate(hM=m, parName="Beta")$support %>%
+    as.data.frame() %>%
+    mutate(variable=m$covNames) %>%
+    filter(variable=="Emissionlow") %>%
+    pivot_longer(!variable, names_to = "genome", values_to = "support") %>%
+    select(genome,support)
+
+inner_join(estimate,support,by=join_by(genome==genome)) %>%
+    mutate(significance=ifelse(support >= 0.9 | support <= 0.1,1,0)) %>%
+    mutate(support=ifelse(mean<0,1-support,support)) %>%
+    left_join(mags_phylum_genomes_sorted, by = join_by(genome == Genome)) %>%
+    mutate(phylum = ifelse(support > 0.9, Phylum, NA)) %>%
+    ggplot(aes(x=mean,y=support, color = phylum))+
+      geom_point(alpha=0.7, shape=16, size=3)+
+      scale_color_manual(values = Phylum_colour) +
+      geom_vline(xintercept = 0) +
+      xlim(c(-0.4,0.4)) +
+      labs(x = "Beta regression coefficient", y = "Posterior probability") +
+      theme_minimal()+
+       theme(legend.position = "right")
+```
+
+### Dispersion plot for Emission
+```{r}
+gradient = c("Emissionlow", "Emissionhigh") #vector value ,can specific by timepoint
+
+gradientlength = length(gradient)
+
+#Treatment-specific gradient predictions
+pred <- constructGradient(m, 
+                      focalVariable = "Emission", #when other variables are not involved
+                      ngrid=gradientlength) %>%
+             predict(m, Gradient = ., expected = TRUE)
+
+
+#Treatment-specific gradient predictions
+predY <- pred %>%
+        do.call(rbind,.) %>%
+        as.data.frame() %>%
+        mutate(Emission=rep(gradient,600)) %>%
+        pivot_longer(-c(Emission), names_to = "genome", values_to = "value") %>% 
+  left_join(mags_phylum_genomes_sorted, by = join_by(genome == Genome)) 
+
+predY.emi <- predY
+
+# Select desired support threshold
+support=0.9
+negsupport=1-support
+
+
+
+test.emi <- getPostEstimate(hM=m, parName="Beta")$support %>%
+    as.data.frame() %>%
+    mutate(variable=m$covNames) %>%
+    pivot_longer(!variable, names_to = "genome", values_to = "value") %>%
+    mutate(trend = case_when(
+          value >= support ~ "Positive",
+          value <= negsupport ~ "Negative",
+          TRUE ~ "Neutral")) %>%
+    filter(variable=="Emissionlow") %>%
+    select(genome,trend,value)
+
+colnames(predY)[colnames(predY) == "value"] <- "predicted_value"
+colnames(test.emi)[colnames(test.emi) == "value"] <- "stat_value"
+
+test.emi <- test.emi %>% 
+    left_join(predY, by=join_by(genome==genome)) %>%
+    #filter(trend != "Neutral") %>%
+    #filter(genome %in% predY_asc)  %>% #only display genomes with contrasting dynamics across treatments
+    group_by(genome, trend, Emission)
+
+test.emi <- test.emi %>% 
+    summarize(predicted_value = mean(predicted_value, na.rm = TRUE), stat_value = mean(stat_value, na.rm = TRUE)) %>%
+    left_join(mags_phylum_genomes_sorted, by=join_by(genome == Genome)) 
+
+test.emi <- test.emi[order(-Emission, genome)] 
+
+test.emi %>%
+    ggplot(aes(x=Emission, y=predicted_value, group=genome, color=Phylum, linetype=trend)) + 
+        geom_line() +
+        scale_linetype_manual(values=c("solid","dashed","solid")) +
+        #scale_color_manual(values=phylum_colors) +
+        facet_grid(fct_rev(trend) ~ Phylum) +
+        labs(y="Genome abundance (log)",x="Emission") +
+        theme(legend.position = "none") +
+        theme_minimal() +
+         theme(legend.position = "none",
+               strip.text.x = element_text(size = 7), 
+               axis.text.x = element_text(angle = 45, hjust = 0.8, size = 7),
+               axis.line.x = element_line(size = 0.5, linetype = "solid", colour = "black"),
+)
+```
+
+```{r}
+
+
+# Refernece tree (for sorting genomes)
+genome_tree_subset <- tree %>%
+        keep.tip(., tip=m$spNames) 
+
+predY.emi %>%
+      pivot_wider(names_from = Emission, values_from = value) %>%
+      unnest(c(`Emissionlow`, `Emissionhigh`)) %>%
+      mutate(diff_low.high = `Emissionlow` - `Emissionhigh`) %>%
+      select(genome, diff_low.high) %>%
+      left_join(mags_phylum_genomes_sorted, by=join_by(genome == Genome)) %>%
+      mutate(genome= factor(genome, levels=genome_tree_subset$tip.label)) %>%
+      ggplot(., aes(y=genome, x=diff_low.high, fill=Phylum, color=Phylum)) +
+          #scale_color_manual(values=colors_alphabetic)+
+          geom_vline(xintercept = 0)+
+          #scale_fill_manual(values=paste0(colors_alphabetic,"80"))+
+          geom_boxplot(outlier.shape = NA) +
+          theme_classic() +
+          theme(axis.text.y = element_blank())
+```
+
+
+
+
+```{r}
+#Compute the residual correlation matrix
+OmegaCor <- computeAssociations(m)
+
+# Refernece tree (for sorting genomes)
+genome_tree_subset <- tree %>%
+        keep.tip(., tip=m$spNames) 
+
+
+#Co-occurrence matrix at the animal level
+supportLevel = 0.95
+toPlot = ((OmegaCor[[1]]$support>supportLevel)
+          + (OmegaCor[[1]]$support<(1-supportLevel))>0)*OmegaCor[[1]]$mean
+
+phylum_colour <- data.frame(Phylum = (unique(count_table$Phylum)), color = (hue_pal()(12)))
+Phylum_colour <- setNames(phylum_colour$color, phylum_colour$Phylum)
+annot.row <- data.frame(row.names = count_table$Genome, Phylum = as.factor(count_table$Phylum))
+
+pheatmap(mat = toPlot, 
+        treeheight_row = 0, 
+         treeheight_col = 0,
+         show_rownames = F, 
+         show_colnames = F,
+         annotation_col = annot.row,
+         annotation_colors = list(Phylum = Phylum_colour),
+         annotation_legend = 0)
+
+```
+
+
+```{r eval = FALSE, include = FALSE}
+
+# Get upper triangle of the correlation matrix
+  get_upper_tri <- function(cormat){
+    cormat[lower.tri(cormat)]<- NA
+    return(cormat)
+  }
+  
+toPlot_upper <- get_upper_tri(toPlot)
+
+melted_eSim_upper <- melt(toPlot_upper, na.rm = TRUE) %>%
+  arrange(value)
+
+fac_levels <- melted_eSim_upper$X1 %>% unique()
+
+data_used <- melted_eSim_upper %>% 
+  mutate(genome1 = factor(melted_eSim_upper$X1, levels = fac_levels)) %>% 
+  mutate(genome2 = factor(melted_eSim_upper$X2, levels = rev(fac_levels)))
+
+p <- data_used %>% ggplot(aes(x = genome2, y = genome1, fill = value)) 
+p <- p + geom_tile() 
+p <- p + scale_fill_gradient2(low = "#be3e2b", mid = "#f4f4f4", high = "#b2b530")
+p <- p + theme(text=element_text(size=3, family="serif"))
+p <- p + theme_void()
+
+
+p
+
+vtree <- genome_tree_subset %>%
+  force.ultrametric(.,method="extend") %>%
+  ggtree(.)
+
+genome_tree_subset$tip.label
+
+
+matrix2 <- toPlot %>%
+  as.data.frame() %>% 
+  rownames_to_column(var="genome1") %>%
+  pivot_longer(!genome1, names_to = "genome2", values_to = "cor") %>%
+  mutate(genome1= factor(genome1, levels=genome_tree_subset$tip.label)) %>%
+  mutate(genome2= factor(genome2, levels=genome_tree_subset$tip.label)) %>% 
+  ggplot(aes(x = genome1, y = genome2, fill = cor)) +
+            geom_tile() + 
+            scale_fill_gradient2(low = "#be3e2b",
+                       mid = "#f4f4f4",
+                       high = "#b2b530")+
+            theme_void()
+
+vtree <- genome_tree_subset %>%
+  force.ultrametric(.,method="extend") %>%
+  ggtree(.)
+
+corr_phylum_tree <- gheatmap(vtree, heatmap, offset=0, width=0.05, colnames=FALSE) +
+      labs(fill="Phylum") +
+   theme(legend.position = "none") 
+  
+```
+
+```{r fig.width= 10, fig.height=10, eval = FALSE, include = FALSE}
+#create composite figure
+leg1 <- get_legend(gheatmap(vtree, heatmap, offset=0, width=0.05, colnames=FALSE, legend_title = "Phylum") + labs(fill="Phylum") +
+   theme(legend.position = "right"))
+
+top_row <- plot_grid(corr_phylum_tree, matrix, align = "h", ncol = 2, rel_heights = c(1, 0.25), rel_widths = c(0.4, 1))
+
+plot_grid(top_row, leg1, ncol = 2, rel_widths = c(1,0.2))
+```
+ 
+```{r}
+# Compute variance partitioning
+varpart=computeVariancePartitioning(m)
+
+datatable(varpart$vals %>%
+   as.data.frame() %>%
+   rownames_to_column(var="variable") %>%
+   pivot_longer(!variable, names_to = "genome", values_to = "value") %>%
+   mutate(variable=factor(variable)) %>%
+   group_by(variable) %>%
+   summarise(mean=mean(value)*100,sd=sd(value)*100))
+
+
+```
+
+```{r}
+# Basal tree
+varpart_tree <- tree %>%
+        keep.tip(., tip=m$spNames) 
+
+#Varpart table
+varpart_table <- varpart$vals %>%
+   as.data.frame() %>%
+   rownames_to_column(var="variable") %>%
+   pivot_longer(!variable, names_to = "genome", values_to = "value") %>%
+   mutate(variable=factor(variable)) %>%
+   mutate(genome=factor(genome, levels=rev(varpart_tree$tip.label)))
+
+# Basal ggtree
+varpart_tree <- varpart_tree %>%
+        force.ultrametric(.,method="extend") %>%
+        ggtree(., size = 0.3)
+```
+
+```{r}
+# Add phylum colors next to the tree tips
+heatmap <- mags_phylum_genomes_sorted %>% arrange(match(Genome, varpart_tree$tip.label)) %>%
+  select(Genome,Phylum) %>%
+    mutate(Phylum = factor(Phylum, levels = unique(Phylum))) %>%
+    column_to_rownames(var = "Genome")
+
+varpart_tree <- gheatmap(varpart_tree, heatmap, offset=0, width=0.1, colnames=FALSE) +
+      labs(fill="Phylum")
+
+#Reset fill scale to use a different colour profile in the heatmap
+varpart_tree <- varpart_tree + new_scale_fill()
+
+# Add variance stacked barplot
+vertical_tree <-  varpart_tree +
+        #scale_fill_manual(values=c("#34738f","#cccccc","#ed8a45","#b2b530","#be3e2b","#f6de6c","#83bb90"))+
+        scale_fill_manual(values=c("#34738f","#cccccc","#ed8a45","#b2b530","#be3e2b","#83bb90","#f6de6c"))+ #"#122f3d"
+        geom_fruit(
+             data=varpart_table,
+             geom=geom_bar,
+             mapping = aes(x=value, y=genome, fill=variable, group=variable),
+             pwidth = 2,
+             offset = 0.17,
+             width= 1,
+             orientation="y",
+             stat="identity")+
+      labs(fill="Variable")
+
+vertical_tree
+
+```
+
+## Community functional prediction
+
+### Plot traits linked to trends (metabolites vs "Emission")
+#### Testing functional trait differences
+Using Wilcoxon test with Benjamini-Hochberg procedure for FDR, identify functional traits that differ between genomes that are either positively or negatively association with emission.
+```{r}
+# Select desired support threshold
+support=0.9
+negsupport=1-support
+
+postestimate_test_emi <- getPostEstimate(hM=m, parName="Beta")$support %>%
+      as.data.frame() %>%
+      mutate(variable=m$covNames) %>%
+      pivot_longer(!variable, names_to = "genome", values_to = "value") %>%
+      mutate(trend = case_when(
+            value >= support ~ "Positive",
+            value <= negsupport ~ "Negative",
+            TRUE ~ "Neutral")) %>%
+      filter(variable==c("Emissionlow"), trend!="Neutral") %>%
+      select(genome,trend) %>%
+      left_join(function_table %>% rownames_to_column(var="genome"), by=join_by(genome==genome)) %>%
+      pivot_longer(-c(genome,trend), names_to = "trait", values_to = "value") %>%
+      group_by(trait) %>%
+      summarise(p_value = wilcox.test(value ~ trend)$p.value) %>%
+      mutate(p_adjust=p.adjust(p_value, method="BH")) %>%
+      filter(p_adjust < 0.05)
+
+datatable(postestimate_test_emi)
+write.csv(postestimate_test_emi, file = "~/Small_Cow/MAG/hmsc_split_seaweed/modelsminus2/panels/Fucntionality_differences_MAG.csv")
+
+```
+
+
+
+
+
+### Plot traits linked to trends (metabolites vs "vsplit")
+```{r}
+# Select desired support threshold
+support=0.9
+negsupport=1-support
+
+postestimate_test_vsplit <- getPostEstimate(hM=m, parName="Beta")$support %>%
+      as.data.frame() %>%
+      mutate(variable=m$covNames) %>%
+      pivot_longer(!variable, names_to = "genome", values_to = "value") %>%
+      mutate(trend = case_when(
+            value >= support ~ "Positive",
+            value <= negsupport ~ "Negative",
+            TRUE ~ "Neutral")) %>%
+      filter(variable=="Vsplitgroup2", trend!="Neutral") %>%
+      select(genome,trend) %>%
+      left_join(function_table %>% rownames_to_column(var="genome"), by=join_by(genome==genome)) %>%
+      pivot_longer(-c(genome,trend), names_to = "trait", values_to = "value") %>%
+      group_by(trait) %>%
+      summarise(p_value = wilcox.test(value ~ trend)$p.value) %>%
+      mutate(p_adjust=p.adjust(p_value, method="BH")) %>%
+      filter(p_adjust < 0.05)
+
+datatable(postestimate_test_vsplit)
+
+
+```
+
+
+### Element level
+```{r}
+predY <- pred %>%
+        do.call(rbind,.) %>%
+        as.data.frame() %>%
+        mutate(Emission=rep(gradient,600)) %>%
+        pivot_longer(-c(Emission), names_to = "genome", values_to = "value") 
+
+#Aggregate bundle-level GIFTs into the compound level
+GIFTs_elements <- to.elements(genome_gifts, gift_cm)
+
+# GIFT at element level(Aggregate bundle-level GIFTs into the compound level)
+GIFTs_elements_filtered <- GIFTs_elements[rownames(GIFTs_elements) %in% rownames(count_table_cov_size %>% 
+  select(-c("D55T5", "D67T5"))), ] %>% 
+  as.data.frame() %>%  
+  select_if(~ sum(.) != 0) #remove column with only 0s
+
+# microbiome-wide GIFTs can also be computed by relying on the slopes of iterations.
+#600 iters and 149 elements
+community_elements <- predY %>%
+  group_by(Emission, genome) %>%
+  mutate(row_id = row_number()) %>%
+  pivot_wider(names_from = genome, values_from = value) %>%
+  ungroup() %>%
+  group_split(row_id) %>%
+  as.list() %>%
+  lapply(., FUN = function(x){x %>%
+    select(-row_id) %>%
+    column_to_rownames(var = "Emission") %>%
+    as.data.frame() %>%
+    exp() %>%
+    t() %>%
+      tss() %>% 
+    to.community(GIFTs_elements_filtered,.,gift_cm) %>% 
+      as.data.frame() %>%
+    rownames_to_column(var="Emission")
+   })
+```
+
+```{r}
+element_pred_em <- map_dfr(community_elements, function(df) {
+  EL <- df %>% filter(Emission == "Emissionlow") %>% select(-Emission)
+  EH <- df %>% filter(Emission == "Emissionhigh") %>% select(-Emission)
+  EH - EL
+}) %>%
+  mutate(iteration=c(1:600)) %>% 
+  pivot_longer(!iteration,names_to="trait",values_to="value") %>%
+      group_by(trait) %>%
+      summarise(mean=mean(value),
+        p1 = quantile(value, probs = 0.1),
+        p9 = quantile(value, probs = 0.9),
+        positive_support = sum(value > 0)/600,
+        negative_support = sum(value < 0)/600) %>%
+      arrange(-positive_support)
+
+# Positively associated
+element_pred_em %>%
+  filter(mean >0) %>%
+  arrange(-positive_support) %>%
+  filter(positive_support>=0.9) 
+
+# Negatively associated
+element_pred_em %>%
+  filter(mean <0) %>%
+  arrange(-negative_support) %>%
+  filter(negative_support>=0.9) 
+```
+
+```{r}
+positive <- element_pred_em %>%
+  filter(mean >0) %>%
+  arrange(mean) %>%
+  filter(positive_support>=0.9) %>%
+  left_join(name_list, by = join_by(trait == Code)) %>% 
+  dplyr::select(-negative_support) %>%
+  dplyr::rename(support=positive_support)
+
+negative <- element_pred_em %>%
+  filter(mean <0) %>%
+  arrange(mean) %>%
+  filter(negative_support>=0.9) %>%
+  left_join(name_list, by = join_by(trait == Code)) %>% 
+  dplyr::select(-positive_support) %>%
+  dplyr::rename(support=negative_support)
+
+```
+
+
+```{r}
+calculate_slope <- function(x) {
+  y <- unlist(x)
+  
+  x_seq <- seq_along(y)
+  
+  # Fit a linear model
+  lm_fit <- lm(y ~ x_seq)
+  
+  slope <- coef(lm_fit)[2]
+  
+  return(slope)
+}
+```
+
+```{r}
+map_result <- map_dfc(community_elements, function(mat) {
+      mat %>%
+        column_to_rownames(var = "Emission") %>%
+        t() %>%
+        as.data.frame() %>%
+        rowwise() %>%
+        mutate(slope = calculate_slope(c_across(everything()))) %>%
+        select(slope) })
+
+map_result_cols_named <- map_result %>%
+      t() %>%
+      as.data.frame() %>%
+      set_names(colnames(community_elements[[1]])[-1])
+
+
+element_predictions <- map_result_cols_named %>%
+      rownames_to_column(var="iteration") %>%
+      pivot_longer(!iteration, names_to="trait",values_to="value") %>%
+      group_by(trait) %>%
+       summarise(mean=mean(value),#trimming the top 10% extreme values
+                median=median(value),
+        p1 = quantile(value, probs = 0.1),
+        p9 = quantile(value, probs = 0.9),
+        positive_support = sum(value > 0)/600,
+        negative_support = sum(value < 0)/600) %>%
+      arrange(-positive_support)
+
+# Positively associated
+datatable(element_predictions %>%
+            left_join(name_list, by = join_by(trait == Code)) %>% 
+  filter(mean >0) %>%
+  arrange(-positive_support))
+```
+
+```{r}
+# Negatively associated
+datatable(element_predictions %>%
+            left_join(name_list, by = join_by(trait == Code)) %>% 
+  filter(mean <0) %>%
+  arrange(-negative_support) )
+```
+
+```{r}
+positive <- element_predictions %>%
+  left_join(name_list, by = join_by(trait == Code)) %>% 
+  filter(mean >0) %>%
+  arrange(-positive_support) %>%
+  select(-negative_support) %>%
+  dplyr::rename(support=positive_support) %>%
+  filter(p_value < 0.05 & support >= 0.7 & p1 >= -0.01)# %>%
+  #dplyr::slice(1:30)
+  
+negative <- element_predictions %>%
+  left_join(name_list, by = join_by(trait == Code)) %>% 
+ filter(mean <0) %>%
+  arrange(-negative_support) %>%
+  select(-positive_support) %>%
+  dplyr::rename(support=negative_support) %>%
+  mutate(support=-support) %>%
+  arrange(support) %>%
+  filter(p_value < 0.05 & support <= -0.7, p9 <= 0.01) %>% 
+  arrange(-mean)
+
+# Define custom transformation
+even_spacing_trans <- trans_new(
+  name = "even_spacing",
+  transform = function(x) {
+    breaks <- custom_breaks
+    scaled_x <- approx(breaks, seq_along(breaks), xout = x)$y - 1
+    return(scaled_x / (length(breaks) - 1))
+  },
+  inverse = function(x) {
+    breaks <- custom_breaks
+    scaled_x <- approx(seq_along(breaks), breaks, xout = x * (length(breaks) - 1) + 1)$y
+    return(scaled_x)
+  },
+  domain = range(custom_breaks)
+)
+
+padj.element <- postestimate_test[postestimate_test$p_value < 0.05,]
+
+test.elements <- bind_rows(positive,negative) %>%
+ # merge(., name_list, by.x="trait", by.y= "Code", all.x = T ) %>%
+  left_join(gift_cm %>% select(Code_element, Function) %>% unique(), by = join_by(trait == Code_element)) %>% 
+  left_join(postestimate_test %>% select(trait, p_adjust), by = join_by(Full_name == trait))
+
+test.elements$new_Full_name <- gsub("\\*", "", test.elements$new_Full_name)
+positive$new_Full_name <- gsub("\\*", "", positive$new_Full_name)
+negative$new_Full_name <- gsub("\\*", "", negative$new_Full_name)
+
+
+
+test.elements %>% 
+  filter(!str_detect(Function, "Cellular structure|Appendages|Spore")) %>% 
+  mutate(trait=factor(new_Full_name,levels=c(positive$new_Full_name, negative$new_Full_name))) %>%
+  ggplot(aes(x=mean, y=fct_rev(trait), xmin=p1, xmax=p9, color=Function)) +
+      geom_point() +
+      geom_errorbar() +
+      scale_color_manual(values = c(rainbow(14))) +
+      theme_minimal() +
+  theme(axis.text.y = element_text(size = 12), legend.text = element_text(size = 11.5)) +
+  geom_point() +
+      labs(x="Regression coefficient",y="Functional trait")
+```
